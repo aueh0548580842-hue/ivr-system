@@ -7,13 +7,14 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const GROQ_API_KEY = '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';
-const GEMINI_API_KEY = 'מפתח_גמיני_שלך'; 
-const ELEVENLABS_API_KEY = 'sk_7ecb6eb9a7dd72f00bb2c3443b7ae07440da6c84784a18ab';
-const AGENT_ID = 'agent_2901kdr1h9nrf7arhjycvdz4bfbt';
-const MONGO_URI = "mongodb+srv://aueh0548580842_db_user:5fYAtRADkCGFHmUi@cluster0.emu588n.mongodb.net/myDatabase?retryWrites=true&w=majority";
+// מפתחות נלקחים ממשתני הסביבה ב-Render לאבטחה מירבית
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI);
+mongoose.connect(MONGO_URI)
+    .then(() => console.log("Connected to MongoDB"))
+    .catch(err => console.error("MongoDB connection error:", err));
 
 const ChatSchema = new mongoose.Schema({
     identifier: String,
@@ -25,57 +26,53 @@ const Chat = mongoose.model('Chat', ChatSchema);
 
 app.post('/ivr', async (req, res) => {
     try {
-        const audioUrl = req.body.FileUrl || req.query.FileUrl;
+        // התאמה לפרמטר מה-ext.ini של שלוחה 10
+        const audioUrl = req.body.file_url || req.query.file_url;
         const identifier = req.body.ApiUserName || req.body.ApiPhone || "unknown";
-        if (!audioUrl) return res.send("read=t-חסרה הקלטה");
 
+        if (!audioUrl) return res.send("read=t-לא התקבלה הקלטה. אנא נסה שוב.");
+
+        // הורדת הקובץ ושליחה ל-STT
         const audioRes = await axios.get(audioUrl, { responseType: 'arraybuffer' });
         const transcription = await speechToText(audioRes.data);
         const userText = transcription.data.text;
 
+        // בדיקה אם המשתמש שתק
+        if (!userText || userText.trim().length < 2) {
+            return res.send("read=t-לא שמעתי את דבריך, אנא דבר חזק יותר.");
+        }
+
         let chat = await Chat.findOne({ identifier }).sort({ lastUpdate: -1 });
         if (!chat) chat = new Chat({ identifier, history: [] });
 
+        // הוספת השאלה להיסטוריה
         chat.history.push({ role: "user", parts: [{ text: userText }] });
+        if (chat.history.length > 12) chat.history = chat.history.slice(-12);
 
+        // פנייה לג'מיני
         const geminiRes = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
             contents: chat.history,
-            system_instruction: { parts: [{ text: "ענה בקצרה ובמקצועיות. הוסף בסוף (סיכום: נושא השיחה)." }] }
+            system_instruction: { parts: [{ text: "ענה בקצרה. בסוף התשובה הוסף את המילה 'סיכום:' ואחריה תיאור קצר מאוד של נושא השאלה." }] }
         });
 
         const fullResponse = geminiRes.data.candidates[0].content.parts[0].text;
-        const parts = fullResponse.split('(סיכום:');
+        
+        // פיצול התשובה מהסיכום
+        const parts = fullResponse.split('סיכום:');
         const cleanResponse = parts[0].trim();
-        if (parts[1]) chat.summary = parts[1].replace(')', '').trim();
+        if (parts[1]) chat.summary = parts[1].trim();
 
         chat.history.push({ role: "model", parts: [{ text: fullResponse }] });
         chat.lastUpdate = Date.now();
         await chat.save();
 
-        res.send(`read=t-${cleanResponse}&target=1&next=goto_this_ext`);
-    } catch (e) { res.send("read=t-שגיאה בעיבוד"); }
-});
+        // החזרת תשובה למערכת וחזרה לשלוחה 1
+        res.send(`read=t-${cleanResponse}&target=1&next=goto_ext-1`);
 
-app.post('/history', async (req, res) => {
-    try {
-        const identifier = req.body.ApiUserName || req.body.ApiPhone || "unknown";
-        const digits = req.body.Digits;
-        let chats = await Chat.find({ identifier }).sort({ lastUpdate: -1 });
-
-        if (chats.length === 0) return res.send("read=t-אין היסטוריה");
-
-        if (digits === '9') {
-            await Chat.findByIdAndDelete(chats[0]._id);
-            return res.send("read=t-נמחק");
-        }
-
-        let chat = (digits === '2' && chats.length > 1) ? chats[1] : chats[0];
-        let msg = `שיחה מ${chat.lastUpdate.toLocaleDateString('he-IL')}: ${chat.summary}. לחידוש הקש 1, למחיקה 9.`;
-        if (chats.length > 1 && digits !== '2') msg += " לקודמת הקש 2.";
-
-        if (digits === '1') return res.send("next=goto_ext-1");
-        res.send(`read=t-${msg}&api_get_digits=1&api_digit_confirm=no`);
-    } catch (e) { res.send("read=t-שגיאה"); }
+    } catch (e) {
+        console.error("Error Detail:", e.response ? e.response.data : e.message);
+        res.send("read=t-סליחה, חלה שגיאה בעיבוד הנתונים.");
+    }
 });
 
 async function speechToText(buffer) {
@@ -87,4 +84,5 @@ async function speechToText(buffer) {
     });
 }
 
-app.listen(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
