@@ -21,7 +21,7 @@ const Chat = mongoose.model('Chat', ChatSchema);
 app.post('/ivr', async (req, res) => {
     const phone = req.body.ApiPhone || "unknown";
     const apiUserName = req.body.ApiUserName || "";
-    const identifier = phone; // מזהה לפי טלפון לצורך אחידות
+    const identifier = phone; 
     const extension = req.body.ApiExtension;
     const digits = req.body.digits;
     let skip = parseInt(req.query.skip || 0);
@@ -34,7 +34,7 @@ app.post('/ivr', async (req, res) => {
         return await handleChat(req, res, identifier, apiUserName, true);
     }
 
-    // --- שלוחה 2: היסטוריה ---
+    // --- שלוחה 2 (רגילה): היסטוריה אישית ---
     if (extension === "2") {
         const chats = await Chat.find({ identifier }).sort({ createdAt: -1 }).skip(skip).limit(1);
         if (!chats.length) return res.send("read=t-אין שיחות נוספות.&next=goto_main");
@@ -50,6 +50,34 @@ app.post('/ivr', async (req, res) => {
         const lastMsg = currentChat.history[currentChat.history.length - 1].parts[0].text.replace(/[&?]/g, ' ');
         return res.send(`read=t-שיחה אחרונה: ${lastMsg}. להמשך הקש 1, לישנה יותר 2, למחיקה 9.&max_digits=1&next=goto_this_ext?skip=${skip}`);
     }
+
+    // --- שלוחה 0/2: שלוחת מנהל (סיכום שיחות) ---
+    // שינוי לבקשתך: השלוחה הזו מרכזת את כל שיחות המערכת עם סיכום AI
+    if (extension === "0/2" || (extension === "2" && req.body.ApiFolder === "0")) {
+        const adminPhone = "0534190819"; // עדכן למספר הטלפון שלך
+        if (phone !== adminPhone) {
+            return res.send("read=t-אין לך הרשאה לגשת לשלוחה זו.&next=goto_main");
+        }
+
+        const allChats = await Chat.find({}).sort({ createdAt: -1 }).skip(skip).limit(1);
+        if (!allChats.length) return res.send("read=t-אין הודעות נוספות במערכת.&next=goto_main");
+
+        const currentChat = allChats[0];
+        
+        try {
+            const summaryRes = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+                contents: currentChat.history,
+                system_instruction: { 
+                    parts: [{ text: "סכם את עיקרי השיחה הזו במשפט אחד קצר וברור עבור המנהל. התמקד בבקשת המשתמש ובתשובה שניתנה." }] 
+                }
+            });
+
+            const summary = summaryRes.data.candidates[0].content.parts[0].text;
+            return res.send(`read=t-שיחה מ${currentChat.identifier}: ${summary.replace(/[&?]/g, ' ')}. לסיכום הבא הקש 2.&max_digits=1&next=goto_this_ext?skip=${skip + 1}`);
+        } catch (e) {
+            return res.send(`read=t-שגיאה בסיכום השיחה. לשיחה הבאה הקש 2.&next=goto_this_ext?skip=${skip + 1}`);
+        }
+    }
 });
 
 async function handleChat(req, res, identifier, userName, isNew, chatId = null) {
@@ -61,27 +89,34 @@ async function handleChat(req, res, identifier, userName, isNew, chatId = null) 
         const transcription = await speechToText(audioRes.data);
         const userText = transcription.data.text;
 
-        let chat;
-        if (isNew || !chatId) {
-            chat = new Chat({ identifier, userName, history: [] });
-        } else {
-            chat = await Chat.findById(chatId);
-        }
-
+        let chat = (isNew || !chatId) ? new Chat({ identifier, userName, history: [] }) : await Chat.findById(chatId);
         chat.history.push({ role: "user", parts: [{ text: userText }] });
 
         const geminiRes = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
             contents: chat.history,
-            system_instruction: { parts: [{ text: `שם המשתמש: ${userName}. ענה בקצרה רבה מאוד.` }] }
+            system_instruction: { 
+                parts: [{ text: `שם המשתמש: ${userName}. ענה בצורה ממוקדת. ענה אך ורק על פי גדרי ההלכה והחוק, והימנע מתכנים שאינם הולמים רוח זו.` }] 
+            },
+            safetySettings: [
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_LOW_AND_ABOVE" },
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_LOW_AND_ABOVE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_LOW_AND_ABOVE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_LOW_AND_ABOVE" }
+            ]
         });
 
-        const reply = geminiRes.data.candidates[0].content.parts[0].text;
+        const candidate = geminiRes.data.candidates[0];
+        if (candidate.finishReason === "SAFETY") {
+            return res.send("read=t-מצטער, התוכן אינו הולם את כללי המערכת.&next=goto_main");
+        }
+
+        const reply = candidate.content.parts[0].text;
         chat.history.push({ role: "model", parts: [{ text: reply }] });
         await chat.save();
 
         return res.send(`read=t-${reply.replace(/[&?]/g, ' ')}&next=goto_this_ext${!isNew ? `?chatId=${chat._id}` : ''}`);
     } catch (e) {
-        return res.send("read=t-חלה שגיאה.&next=goto_main");
+        return res.send("read=t-חלה שגיאה בעיבוד.&next=goto_main");
     }
 }
 
